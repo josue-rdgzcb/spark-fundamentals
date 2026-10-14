@@ -744,3 +744,548 @@ En este ejemplo:
 > 8. Los argumentos posteriores al archivo principal se entregan a la aplicación.
 > 9. `spark-submit` inicia el despliegue; `SparkSession` proporciona la interfaz para trabajar con Spark desde el código.
 > 10. Los recursos solicitados mediante `spark-submit` dependen de la disponibilidad y las políticas de YARN.
+
+---
+
+## 4.4. Configuración de aplicaciones Spark
+
+La configuración de una aplicación Apache Spark determina los recursos que solicita al clúster, cómo distribuye el procesamiento y qué optimizaciones utiliza durante su ejecución.
+
+Cuando Spark se ejecuta sobre **Apache Hadoop YARN**, es necesario distinguir entre:
+
+- **Recursos de infraestructura:** executors, cores y memoria.
+- **Paralelismo:** número de particiones y tasks.
+- **Configuraciones de procesamiento:** parámetros de Spark SQL y optimizaciones.
+- **Configuraciones de despliegue:** propiedades definidas antes de iniciar la aplicación.
+
+Una configuración adecuada busca utilizar eficientemente los recursos disponibles sin generar sobrecarga innecesaria ni problemas de memoria.
+
+---
+
+### 4.4.1. Tipos de configuraciones de Spark
+
+Las propiedades de Spark pueden clasificarse según su propósito.
+
+| Categoría | Ejemplo | Propósito |
+|---|---|---|
+| Aplicación | `spark.app.name` | Identificar la aplicación |
+| Despliegue | `spark.master` | Seleccionar el administrador de recursos |
+| Executors | `spark.executor.instances` | Solicitar un número inicial de executors |
+| CPU | `spark.executor.cores` | Asignar cores a cada executor |
+| Memoria | `spark.executor.memory` | Configurar memoria heap por executor |
+| Paralelismo | `spark.sql.shuffle.partitions` | Configurar particiones iniciales de ciertos shuffles |
+| Optimización | `spark.sql.adaptive.enabled` | Habilitar Adaptive Query Execution |
+
+Estas propiedades pueden definirse mediante `spark-submit`, archivos de configuración o las APIs de Spark.
+
+No todas pueden modificarse después de iniciar la aplicación.
+
+---
+
+### 4.4.2. Configuración de executors y cores
+
+Los **executors** son procesos encargados de ejecutar las tasks de Spark y administrar datos utilizados durante el procesamiento.
+
+Cada executor dispone de recursos de CPU y memoria.
+
+Las propiedades principales son:
+
+| Propiedad | Descripción |
+|---|---|
+| `spark.executor.instances` | Número inicial de executors solicitado |
+| `spark.executor.cores` | Número de cores asignados a cada executor |
+| `spark.task.cpus` | Número de cores requeridos por task |
+
+Ejemplo:
+
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
+  --num-executors 4 \
+  --executor-cores 3 \
+  customer_analysis.py
+```
+
+Esta aplicación solicita cuatro executors, cada uno con tres cores.
+
+Su capacidad teórica de ejecución simultánea, con `spark.task.cpus=1`, sería:
+
+\[
+\text{Slots de ejecución} =
+\text{Executors} \times \text{Cores por executor}
+\]
+
+\[
+4 \times 3 = 12
+\]
+
+Por lo tanto, podrían ejecutarse hasta **12 tasks simultáneamente**, siempre que existan suficientes tasks pendientes y YARN haya asignado los recursos solicitados.
+
+Si cada task requiere dos cores:
+
+\[
+\text{Slots} =
+4 \times \left\lfloor \frac{3}{2} \right\rfloor = 4
+\]
+
+Esto demuestra que el paralelismo real también depende de la configuración de las tasks.
+
+> **Importante:** solicitar más executors no garantiza un procesamiento más rápido. El rendimiento depende del volumen de datos, el número de particiones, las operaciones y los recursos efectivamente disponibles.
+
+---
+
+### 4.4.3. Configuración de memoria: Driver y Executors
+
+Spark utiliza memoria para ejecutar operaciones, mantener estructuras intermedias, almacenar datos en caché y administrar diferentes componentes internos.
+
+Las propiedades principales son:
+
+| Propiedad | Descripción |
+|---|---|
+| `spark.driver.memory` | Memoria heap de la JVM del Driver |
+| `spark.executor.memory` | Memoria heap de la JVM de cada executor |
+| `spark.executor.memoryOverhead` | Memoria adicional del container del executor |
+| `spark.driver.memoryOverhead` | Memoria adicional del container del Driver, cuando corresponde |
+| `spark.memory.fraction` | Fracción del heap disponible para la memoria unificada de ejecución y almacenamiento |
+
+---
+
+#### Ejemplo de configuración
+
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
+  --executor-memory 6G \
+  --driver-memory 4G \
+  --conf spark.executor.memoryOverhead=2G \
+  customer_analysis.py
+```
+
+En este caso, cada executor solicita:
+
+- 6 GiB de memoria heap.
+- 2 GiB de memoria adicional (*overhead*).
+
+Si no se han configurado componentes adicionales de memoria, el container del executor requiere aproximadamente:
+
+\[
+6 + 2 = 8\ \text{GiB}
+\]
+
+La memoria adicional es importante en PySpark porque los procesos Python que ejecutan determinadas tareas consumen memoria fuera del heap de la JVM.
+
+En configuraciones que utilizan `spark.executor.pyspark.memory`, esta reserva puede contabilizarse por separado dentro del tamaño del container.
+
+---
+
+#### ¿Por qué no asignar toda la memoria al heap?
+
+Porque un executor puede necesitar memoria para:
+
+- La JVM y sus estructuras fuera del heap.
+- Procesos Python.
+- Buffers y operaciones nativas.
+- Otros componentes auxiliares.
+
+Por ello, la memoria del container de YARN puede ser mayor que `spark.executor.memory`.
+
+---
+
+#### Memoria del Driver
+
+El Driver necesita memoria para administrar metadatos, planes de ejecución y resultados que regresan al proceso principal.
+
+Por ejemplo, operaciones como:
+
+```python
+df.collect()
+```
+
+pueden transferir grandes cantidades de datos al Driver.
+
+Esto puede provocar problemas de memoria si el resultado es demasiado grande.
+
+Para procesamiento distribuido, normalmente es preferible mantener las operaciones dentro de Spark y evitar recopilar conjuntos completos de datos en el Driver.
+
+---
+
+### 4.4.4. Paralelismo y particiones
+
+El paralelismo de Spark depende tanto de los recursos disponibles como del número de particiones que deben procesarse.
+
+Recordemos:
+
+- Los **executors** ejecutan tasks.
+- Los **cores** permiten ejecutar tasks simultáneamente.
+- Las **particiones** dividen los datos en unidades de procesamiento.
+- Cada stage normalmente genera una task por partición.
+
+Supongamos:
+
+```text
+Executors: 4
+Cores por executor: 3
+Slots disponibles: 12
+Particiones del stage: 48
+```
+
+Si las tasks tienen duraciones similares, Spark podría procesarlas en aproximadamente cuatro grupos de ejecución (*waves*):
+
+\[
+\text{Waves} \approx
+\left\lceil \frac{48}{12} \right\rceil = 4
+\]
+
+Esta estimación supone disponibilidad constante de recursos y no considera diferencias en duración, skew ni sobrecarga de planificación.
+
+---
+
+#### Configuración de particiones de shuffle
+
+```python
+spark.conf.set(
+    "spark.sql.shuffle.partitions",
+    "48"
+)
+```
+
+Esta propiedad establece el número inicial predeterminado de particiones para determinadas operaciones de shuffle en Spark SQL.
+
+Por ejemplo:
+
+```python
+result = (
+    spark.table("telecom.customers")
+    .groupBy("region")
+    .count()
+)
+```
+
+La agregación puede requerir un shuffle para redistribuir los registros.
+
+Sin embargo, si Adaptive Query Execution está habilitado, Spark puede ajustar el número de particiones utilizadas durante la ejecución.
+
+---
+
+#### repartition() y coalesce()
+
+También es posible modificar el particionado de un DataFrame.
+
+```python
+df = df.repartition(48)
+```
+
+`repartition()` redistribuye los datos y normalmente implica un shuffle.
+
+```python
+df = df.coalesce(12)
+```
+
+`coalesce()` permite reducir particiones y normalmente evita un shuffle completo, aunque puede generar distribuciones desbalanceadas.
+
+---
+
+### 4.4.5. Dynamic Allocation
+
+**Dynamic Allocation** permite que Spark ajuste dinámicamente el número de executors según la carga de trabajo.
+
+En lugar de mantener necesariamente un número fijo de executors, Spark puede solicitar recursos adicionales cuando existen tasks pendientes y liberar executors cuando dejan de ser necesarios.
+
+Configuración ilustrativa:
+
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
+  --conf spark.dynamicAllocation.enabled=true \
+  --conf spark.dynamicAllocation.minExecutors=2 \
+  --conf spark.dynamicAllocation.initialExecutors=4 \
+  --conf spark.dynamicAllocation.maxExecutors=10 \
+  customer_analysis.py
+```
+
+| Propiedad | Función |
+|---|---|
+| `spark.dynamicAllocation.enabled` | Habilita la asignación dinámica |
+| `spark.dynamicAllocation.minExecutors` | Límite inferior de executors |
+| `spark.dynamicAllocation.initialExecutors` | Número inicial solicitado |
+| `spark.dynamicAllocation.maxExecutors` | Límite superior de executors |
+
+En este ejemplo, Spark comienza solicitando cuatro executors y puede ajustar su cantidad dentro de los límites configurados.
+
+La disponibilidad efectiva depende de YARN.
+
+**Consideración:** Dynamic Allocation requiere mecanismos compatibles para preservar los datos de shuffle cuando se retiran executors, como el External Shuffle Service o mecanismos de seguimiento de shuffle compatibles con la versión y configuración del clúster.
+
+---
+
+#### Asignación estática vs. dinámica
+
+| Característica | Asignación estática | Dynamic Allocation |
+|---|---|---|
+| Número de executors | Generalmente fijo | Variable |
+| Adaptación a la carga | Limitada | Automática |
+| Liberación de recursos ociosos | No automática por esta función | Sí, según configuración |
+| Complejidad | Menor | Mayor |
+| Uso habitual | Cargas predecibles | Cargas variables y clústeres compartidos |
+
+---
+
+### 4.4.6. Configuraciones de Spark SQL y AQE
+
+Además de los recursos físicos, Spark permite configurar optimizaciones del procesamiento estructurado.
+
+Entre las propiedades más importantes se encuentran:
+
+| Propiedad | Función |
+|---|---|
+| `spark.sql.shuffle.partitions` | Particiones iniciales predeterminadas de ciertos shuffles |
+| `spark.sql.adaptive.enabled` | Habilita Adaptive Query Execution |
+| `spark.sql.autoBroadcastJoinThreshold` | Umbral para considerar ciertos broadcast joins |
+| `spark.sql.adaptive.coalescePartitions.enabled` | Permite combinar particiones de shuffle con AQE |
+
+Ejemplo:
+
+```python
+spark.conf.set(
+    "spark.sql.adaptive.enabled",
+    "true"
+)
+
+spark.conf.set(
+    "spark.sql.shuffle.partitions",
+    "48"
+)
+```
+
+---
+
+#### Adaptive Query Execution
+
+AQE permite ajustar determinadas decisiones del plan físico a partir de estadísticas obtenidas durante la ejecución.
+
+Puede realizar optimizaciones como:
+
+1. Combinar particiones pequeñas después de un shuffle.
+2. Modificar determinadas estrategias de join.
+3. Mitigar algunos casos de distribución desbalanceada (*data skew*).
+
+Por ejemplo, una consulta puede comenzar con 48 particiones de shuffle y terminar utilizando menos particiones si AQE determina que conviene combinarlas.
+
+Por lo tanto, `spark.sql.shuffle.partitions` no garantiza que todos los stages tengan exactamente ese número de particiones.
+
+---
+
+### 4.4.7. SparkConf, spark-defaults.conf y SparkSession.conf
+
+Spark proporciona distintos mecanismos para establecer configuraciones.
+
+---
+
+#### spark-submit
+
+Permite definir propiedades antes de iniciar la aplicación.
+
+```bash
+spark-submit \
+  --master yarn \
+  --executor-memory 6G \
+  --conf spark.sql.shuffle.partitions=48 \
+  customer_analysis.py
+```
+
+Es el mecanismo recomendado para definir propiedades de despliegue y recursos en aplicaciones batch sobre YARN.
+
+---
+
+#### spark-defaults.conf
+
+Es un archivo de configuración que permite definir propiedades predeterminadas.
+
+```properties
+spark.master                       yarn
+spark.submit.deployMode            cluster
+spark.executor.instances           4
+spark.executor.cores               3
+spark.executor.memory              6g
+spark.sql.shuffle.partitions       48
+spark.sql.adaptive.enabled         true
+```
+
+También podemos utilizar un archivo específico:
+
+```bash
+spark-submit \
+  --properties-file spark-app.conf \
+  customer_analysis.py
+```
+
+---
+
+#### SparkConf
+
+Permite definir propiedades mediante un objeto de configuración.
+
+```python
+from pyspark import SparkConf
+
+conf = (
+    SparkConf()
+    .setAppName("CustomerAnalysis")
+    .set("spark.sql.shuffle.partitions", "48")
+)
+```
+
+En aplicaciones modernas basadas en DataFrames, normalmente se utiliza `SparkSession.builder` en lugar de crear manualmente un SparkContext con SparkConf.
+
+---
+
+#### spark.conf
+
+Permite consultar y modificar determinadas configuraciones de sesión.
+
+```python
+spark.conf.set(
+    "spark.sql.shuffle.partitions",
+    "48"
+)
+```
+
+No todas las propiedades pueden modificarse después de inicializar Spark.
+
+Por ejemplo, aumentar `spark.executor.memory` mediante `spark.conf.set()` no redimensiona los executors que ya están ejecutándose.
+
+---
+
+### 4.4.8. Precedencia y buenas prácticas
+
+Cuando una propiedad se define en varios lugares, Spark aplica reglas de precedencia.
+
+En términos generales:
+
+1. Configuraciones explícitas de la aplicación mediante `SparkConf`, cuando corresponden y son aplicables.
+2. Opciones de `spark-submit` y propiedades proporcionadas mediante `--conf`.
+3. Valores predeterminados establecidos en archivos como `spark-defaults.conf`.
+
+Algunas propiedades de despliegue tienen restricciones adicionales y deben definirse antes de iniciar el Driver o SparkContext.
+
+---
+
+#### Buenas prácticas
+
+- Definir los recursos de infraestructura mediante `spark-submit` o archivos de configuración.
+- Mantener el código de procesamiento independiente de configuraciones específicas del clúster cuando sea posible.
+- Considerar la memoria adicional de los containers de YARN.
+- No confundir número de executors con número de particiones.
+- Evitar configurar particiones excesivamente grandes o demasiado pequeñas.
+- Utilizar Dynamic Allocation cuando resulte adecuado para el entorno.
+- Inspeccionar Spark UI para evaluar el comportamiento real de la aplicación.
+- Ajustar configuraciones a partir de mediciones y no únicamente de valores teóricos.
+
+---
+
+### 4.4.9. Ejemplo integrado de configuración sobre YARN
+
+Supongamos una aplicación batch que procesa información de clientes almacenada en Hive.
+
+La configuración inicial será:
+
+| Recurso | Valor |
+|---|---|
+| Executors | 4 |
+| Cores por executor | 3 |
+| Memoria heap por executor | 6 GiB |
+| Memory overhead | 2 GiB |
+| Memoria heap del Driver | 4 GiB |
+| Particiones iniciales de shuffle | 48 |
+| AQE | Habilitado |
+
+---
+
+#### Envío de la aplicación
+
+```bash
+spark-submit \
+  --master yarn \
+  --deploy-mode cluster \
+  --name CustomerAnalysis \
+  --num-executors 4 \
+  --executor-cores 3 \
+  --executor-memory 6G \
+  --driver-memory 4G \
+  --conf spark.executor.memoryOverhead=2G \
+  --conf spark.sql.shuffle.partitions=48 \
+  --conf spark.sql.adaptive.enabled=true \
+  customer_analysis.py
+```
+
+---
+
+#### Capacidad solicitada
+
+**CPU:**
+
+\[
+4\ \text{executors} \times 3\ \text{cores}
+= 12\ \text{cores}
+\]
+
+**Memoria de containers de executors:**
+
+\[
+4 \times (6 + 2)\ \text{GiB}
+= 32\ \text{GiB}
+\]
+
+Estos 32 GiB representan la memoria solicitada para los containers de executors bajo las suposiciones del ejemplo, sin incluir el container del Driver ni otros componentes adicionales.
+
+**Paralelismo:**
+
+Con 48 particiones y 12 slots de ejecución:
+
+\[
+\text{Waves} \approx
+\left\lceil \frac{48}{12} \right\rceil = 4
+\]
+
+Este cálculo representa una aproximación teórica para un stage con 48 tasks y `spark.task.cpus=1`.
+
+---
+
+#### Interpretación
+
+La aplicación solicita recursos para ejecutar hasta doce tasks simultáneamente.
+
+Si un stage contiene 48 particiones, sus tasks podrían distribuirse en aproximadamente cuatro grupos de ejecución.
+
+No obstante, el rendimiento real dependerá de:
+
+- La cantidad de datos procesados.
+- El tamaño y distribución de las particiones.
+- Las operaciones realizadas.
+- El costo de los shuffles.
+- La disponibilidad de recursos en YARN.
+- Las optimizaciones aplicadas por Spark SQL y AQE.
+
+Por ello, esta configuración debe considerarse un **punto de partida ilustrativo**, no una configuración óptima universal.
+
+> **En resumen:** configurar Spark sobre YARN implica equilibrar recursos computacionales, memoria, paralelismo y optimizaciones. Una buena configuración no consiste simplemente en solicitar más recursos, sino en asignarlos de acuerdo con las características de los datos y del procesamiento distribuido.
+
+---
+
+### 4.4.10. Ideas clave
+
+> 1. La configuración de Spark determina los recursos solicitados y diversos aspectos del procesamiento.
+> 2. En YARN, los recursos efectivos dependen de la disponibilidad y las políticas del clúster.
+> 3. Los executors proporcionan procesos de ejecución; sus cores determinan parte de la capacidad de paralelismo.
+> 4. La memoria de un container incluye más componentes que el heap de su executor.
+> 5. En PySpark, los procesos Python pueden consumir memoria fuera del heap de la JVM.
+> 6. El paralelismo depende tanto de los recursos disponibles como del número de particiones.
+> 7. `spark.sql.shuffle.partitions` define un valor inicial para determinadas operaciones de shuffle.
+> 8. Dynamic Allocation permite ajustar el número de executors según la carga de trabajo.
+> 9. AQE puede modificar determinadas decisiones del plan físico durante la ejecución.
+> 10. Las propiedades de infraestructura deben configurarse antes de iniciar la aplicación cuando así lo requieran.
+> 11. Spark UI permite evaluar si los recursos y parámetros elegidos están funcionando adecuadamente.
+
